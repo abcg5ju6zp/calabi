@@ -55,6 +55,13 @@ type Bus struct {
 	mu     sync.Mutex
 	subs   []*subscription
 	closed bool
+
+	// resumeFns are notified after a cert-event stream is RE-ESTABLISHED
+	// following a drop (never on the first open). certclient uses the hint
+	// to compare the server generation immediately and either confirm it
+	// missed nothing or reconcile, instead of waiting for the poll backstop.
+	resumeMu  sync.Mutex
+	resumeFns []func()
 }
 
 // NewBus wraps client with the eventbus.Bus surface. The parent ctx
@@ -309,15 +316,37 @@ func (b *Bus) addSub(s *subscription) {
 	b.subs = append(b.subs, s)
 }
 
-// subscribeCertEvents opens a SubscribeCertEvents stream and dispatches
-// matching kind events to handler. The original NATS subject is
-// preserved in the Msg.Subject so the existing edge code's
-// certevents.ParseSubject calls keep working.
+// OnCertStreamResume registers fn to run after a SubscribeCertEvents
+// stream has been RE-OPENED following a drop. The first successful open at
+// Subscribe time does NOT fire it. Registered callbacks must be
+// non-blocking — certclient's RequestResync is (a buffered, coalescing
+// signal). Registration is process-lifetime; the bus and certclient shut
+// down together.
+func (b *Bus) OnCertStreamResume(fn func()) {
+	if fn == nil {
+		return
+	}
+	b.resumeMu.Lock()
+	b.resumeFns = append(b.resumeFns, fn)
+	b.resumeMu.Unlock()
+}
+
+func (b *Bus) fireCertStreamResume() {
+	b.resumeMu.Lock()
+	fns := append([]func(){}, b.resumeFns...)
+	b.resumeMu.Unlock()
+	for _, fn := range fns {
+		fn()
+	}
+}
+
 // reconnectingStream pumps `recv(stream)` until it errors, then RE-OPENS via
 // `open` with capped exponential backoff, until the subscription ctx is
 // cancelled (Drain/Close). `first` is the already-opened stream so the caller
 // keeps its fail-fast "return error if the very FIRST open fails" contract.
 // recv pulls + dispatches one event, returning the stream error when it dies.
+// onResume, when non-nil, fires after every successful RE-open (not the
+// first), so a consumer can reconcile anything the disconnect made it miss.
 //
 // Why this exists: the edge's cert / usage / evict events all ride bff-edge
 // server-streams. Without reconnect, a single bff-edge restart — a routine
@@ -331,6 +360,7 @@ func reconnectingStream[S any](
 	first S,
 	open func(context.Context) (S, error),
 	recv func(S) error,
+	onResume func(),
 ) {
 	defer close(doneCh)
 	const base, max = 500 * time.Millisecond, 30 * time.Second
@@ -349,6 +379,7 @@ func reconnectingStream[S any](
 			backoff = base // healthy traffic resets the backoff
 		}
 		// Re-open with backoff until it succeeds or we're cancelled.
+		reopened := false
 		for {
 			select {
 			case <-ctx.Done():
@@ -363,6 +394,7 @@ func reconnectingStream[S any](
 				stream = s
 				backoff = base
 				logger.Info("stream reconnected")
+				reopened = true
 				break
 			}
 			if ctx.Err() != nil {
@@ -370,9 +402,20 @@ func reconnectingStream[S any](
 			}
 			logger.Info("resubscribe failed; will retry", "err", err)
 		}
+		if reopened && onResume != nil {
+			onResume()
+		}
 	}
 }
 
+// subscribeCertEvents opens a SubscribeCertEvents stream and dispatches
+// matching kind events to handler. The original NATS subject is
+// preserved in the Msg.Subject so the existing edge code's
+// certevents.ParseSubject calls keep working.
+//
+// Reopens of the upsert/delete streams also fire the cert-resume hooks, so
+// certclient reconciles the server generation right after a disconnect;
+// the ACME challenge streams carry no generation and do not.
 func (b *Bus) subscribeCertEvents(wantKind string, handler func(*eventbus.Msg)) (eventbus.Subscription, error) {
 	ctx, cancel := context.WithCancel(b.ctx)
 	doneCh := make(chan struct{})
@@ -397,9 +440,13 @@ func (b *Bus) subscribeCertEvents(wantKind string, handler func(*eventbus.Msg)) 
 		return nil
 	}
 
+	var onResume func()
+	if wantKind == "upsert" || wantKind == "delete" {
+		onResume = b.fireCertStreamResume
+	}
 	sub := &subscription{logger: logger, cancel: cancel, doneCh: doneCh}
 	b.addSub(sub)
-	go reconnectingStream(ctx, doneCh, logger, stream, open, recv)
+	go reconnectingStream(ctx, doneCh, logger, stream, open, recv, onResume)
 	return sub, nil
 }
 
@@ -436,7 +483,7 @@ func (b *Bus) subscribeEvictEvents(callerSubject string, handler func(*eventbus.
 
 	sub := &subscription{logger: logger, cancel: cancel, doneCh: doneCh}
 	b.addSub(sub)
-	go reconnectingStream(ctx, doneCh, logger, stream, open, recv)
+	go reconnectingStream(ctx, doneCh, logger, stream, open, recv, nil)
 	return sub, nil
 }
 
@@ -469,7 +516,7 @@ func (b *Bus) subscribeUsageEvents(wantKind string, handler func(*eventbus.Msg))
 
 	sub := &subscription{logger: logger, cancel: cancel, doneCh: doneCh}
 	b.addSub(sub)
-	go reconnectingStream(ctx, doneCh, logger, stream, open, recv)
+	go reconnectingStream(ctx, doneCh, logger, stream, open, recv, nil)
 	return sub, nil
 }
 

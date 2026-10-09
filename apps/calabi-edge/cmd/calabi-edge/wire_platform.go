@@ -349,12 +349,23 @@ func wirePlatform(ctx context.Context, logger *slog.Logger, in platformInputs) (
 	case cpBFF != nil:
 		// RefreshInterval left at zero: certclient.DefaultRefreshInterval. It was
 		// a config knob until 2.0.0 and no deployed file ever set it.
+		//
+		// StateDir carries the encrypted generation snapshot: after a restart
+		// with the control plane down the edge serves the last CONFIRMED pool
+		// instead of failing every handshake until cert-svc answers.
 		cc, cErr := certclient.StartWithClient(ctx, logger, cpBFF.Client, certclient.Options{
-			OrgID: cfg.OrgID,
-			Bus:   bus,
+			OrgID:    cfg.OrgID,
+			Bus:      bus,
+			StateDir: cfg.State.Dir,
 		})
 		if cErr != nil {
 			return fail(fmt.Errorf("cert via bff-edge: %w", cErr))
+		}
+		// After a cert-event stream drops and re-opens, reconcile the server
+		// generation at once (compare digest; pull only if it moved) instead
+		// of waiting out the 5-minute poll backstop.
+		if rb, ok := bus.(*bffedgeclient.Bus); ok {
+			rb.OnCertStreamResume(cc.RequestResync)
 		}
 		closers = append(closers, cc)
 		certCli = cc

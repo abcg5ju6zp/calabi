@@ -96,6 +96,13 @@ func DeleteSubject(orgID int64) string {
 //   - Fingerprint: SHA256 of the leaf DER; lets the edge skip the GetCert
 //     refetch if it already has this exact bytes (e.g. the
 //     same publish was re-delivered)
+//   - Version: the server-side ordering watermark of this mutation — the
+//     cert row's updated_at (or deleted_at) as Unix nanos. The edge uses it
+//     to fence STALE state: an old full listing must not downgrade a fresher
+//     push, and a delete that arrives before a stale listing must not let the
+//     stale listing resurrect the cert. Zero means the publisher did not stamp
+//     one; ordering guards then degrade to fingerprint/authoritative-listing
+//     behaviour. Optional on purpose: old publishers simply omit it.
 //
 // Note: NO PEM, NO PRIVATE KEY. The edge fetches those via GetCert RPC
 // after deciding to react to this event.
@@ -105,6 +112,7 @@ type CertEvent struct {
 	SANs        []string `json:"sans,omitempty"`
 	Subject     string   `json:"subject,omitempty"`
 	Fingerprint string   `json:"fingerprint,omitempty"`
+	Version     int64    `json:"version,omitempty"`
 }
 
 // ChallengeEvent is the JSON body of the ACME http-01 present/cleanup
