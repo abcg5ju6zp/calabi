@@ -75,6 +75,30 @@ func buildConfigPushFromDelta(d configclient.Delta, baseDomain string) *proto.Co
 	}
 }
 
+// buildFullConfigPush projects an authoritative route set for ONE client
+// into a FullSync CONFIG_PUSH: the client replaces its local tunnel
+// snapshot with upsert_proxies and closes every proxy missing from the
+// list. Used when a full snapshot replacement arrives on the config
+// stream (the post-handshake catch-up builds the same shape from a
+// tunnel-svc ListByClient).
+func buildFullConfigPush(routes []configclient.Route, baseDomain string) *proto.ConfigPush {
+	push := &proto.ConfigPush{
+		FullSync:      true,
+		UpsertProxies: make([]proto.UpsertProxy, 0, len(routes)),
+	}
+	for _, d := range routes {
+		push.UpsertProxies = append(push.UpsertProxies, proto.UpsertProxy{
+			TunnelID:   int64(d.ID),
+			Name:       d.Name,
+			Type:       proto.ProxyKind(d.Type),
+			LocalAddr:  d.LocalAddr,
+			Domain:     resolveProxyHost(d.Domain, d.Subdomain, baseDomain),
+			RemotePort: uint32(d.RemotePort),
+		})
+	}
+	return push
+}
+
 // makePostHandshake returns the per-session catch-up hook called by the
 // control listener right after AUTH succeeds. When wired (tunnel-svc
 // available + session announced a DeviceID), it fetches every tunnel

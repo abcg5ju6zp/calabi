@@ -68,10 +68,6 @@ type tunnelPersisterAdapter struct {
 // interface so the failure path can be tested without a real pool.
 type portReserver interface{ Reserve(port uint32) }
 
-// portUnreserver is the other half, for routeApplier: a DELETE is the one
-// event that frees a reserved number again.
-type portUnreserver interface{ Unreserve(port uint32) }
-
 // portInUseReason is the status_reason prefix stamped on a tunnel whose claim
 // was refused because its remote port is bound to another row on this edge.
 // The port number follows, e.g. "port_in_use:20000". Same shape as
@@ -375,24 +371,44 @@ func (a *tunnelPersisterAdapter) OnProxyClosed(sess *session.Session, p *session
 	}
 }
 
+// portPoolController is the routeApplier's sliver of router.PortPool: a
+// route set REPLACEMENT must both free numbers the server says are gone
+// (Unreserve, the delete path) and take numbers newly owned by this
+// edge out of circulation (Reserve, the snapshot/upsert path), so the
+// pool never drifts from the confirmed tunnel set.
+type portPoolController interface {
+	Reserve(port uint32)
+	Unreserve(port uint32)
+}
+
 // routeApplier wires configclient.Applier into the local router.
 //
-// scope:
-//   - delete + local edge: unregister via registrar (achieves cross-process
-//     "calabi delete" → all edges drop the route)
-//   - upsert + local edge: no-op (the route is already in our local map
-//     from the live client session; tunnel-svc is just confirming what we
-//     already know)
-//   - any kind + remote edge: log only; will route visitor traffic to
-//     the right edge instead of returning 404
+// It is the edge's transactional half of the config-generation
+// protocol: configclient acks a generation only AFTER every step here
+// has succeeded. The previously CONFIRMED route set (keyed by tunnel
+// id) is kept in memory; each apply is a reconcile from that set to
+// the target set, in this order:
 //
-// Added with console-created tunnels:
-//   - upsert (any edge) + Route.ClientID matches a live session on this
-//     edge: forward the upsert to the client over CONFIG_PUSH so the
-//     client's UI / future daemon can react. Routes with edge_node_id=0
-//     (console-initiated, no edge claimed yet) reach every edge via
-//     the relaxed hub filter; only the edge holding the matching client
-//     session will actually forward.
+//  1. CONFIG_PUSH to every ONLINE owning client FIRST — it is the only
+//     step that can fail (broken client control stream). A client being
+//     offline is success: its catch-up FullSync on the next handshake
+//     reconciles its UI.
+//  2. Local, non-failing effects: port-pool reserve/unreserve, router
+//     teardown for deletes, hot policy swap for changed config_json.
+//
+// When step 1 fails nothing local has moved; any partial local effect
+// from step 2 is undone and the caller (configclient) nacks the
+// generation and resyncs from the confirmed cursor, so router, port
+// pool, policy and the client UIs can never disagree across
+// generations.
+//
+// scope (unchanged):
+//   - delete + local edge: unregister via registrar (cross-process
+//     "calabi delete" → all edges drop the route) + free the port
+//   - upsert + local edge: keep the route (it is live from the client
+//     session), hot-apply policy, pull the route's port out of the pool
+//   - remote/edge_node_id=0 routes: locating/UI only — never touch the
+//     local router or port pool
 type routeApplier struct {
 	edgeNodeID int64
 	registrar  session.ProxyRegistrar
@@ -407,83 +423,386 @@ type routeApplier struct {
 	// console tunnel's requested subdomain PREFIX to <prefix>.<base> before
 	// forwarding the CONFIG_PUSH to the daemon (Phase 2).
 	baseDomain string
-	// ports is this edge's TCP/UDP allocator, held for exactly one job: when a
-	// row is deleted, the number it held becomes free again. Nothing else in
-	// this type touches it.
-	ports portUnreserver
+	// ports is this edge's TCP/UDP pool, driven to match the confirmed local
+	// route set: Reserve on snapshot/upsert, Unreserve on delete.
+	ports portPoolController
+
+	// mu guards confirmed + streamReserved. Applier calls are serialized by
+	// configclient, but the manager's sessions read live proxies concurrently.
+	mu sync.Mutex
+	// confirmed is the last fully-applied stream route set (all edges). It
+	// is the compensation target and the diff baseline.
+	confirmed map[int64]configclient.Route
+	// streamReserved is the set of ports THIS applier currently holds
+	// reserved in the pool, so a reconcile never releases a port it did not
+	// take (e.g. one the boot DB-seed or the persister owns).
+	streamReserved map[uint32]struct{}
 }
 
-func (a *routeApplier) OnSnapshot(routes []configclient.Route) {
-	// log only. reconciles snapshot against local
-	// router (delete locally-owned routes that the snapshot doesn't
-	// mention, hint at remote routes).
+func indexRoutes(routes []configclient.Route) map[int64]configclient.Route {
+	out := make(map[int64]configclient.Route, len(routes))
+	for _, r := range routes {
+		out[int64(r.ID)] = r
+	}
+	return out
+}
+
+func cloneRoutes(in map[int64]configclient.Route) map[int64]configclient.Route {
+	out := make(map[int64]configclient.Route, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
+}
+
+// OnSnapshot replaces the view with the server's full route set. Used on
+// first connection and whenever the server cannot resume from the
+// cursor. All steps succeed together or local state is compensated back
+// to the confirmed set and an error is returned.
+func (a *routeApplier) OnSnapshot(routes []configclient.Route) error {
+	a.mu.Lock()
+	from := cloneRoutes(a.confirmed)
+	a.mu.Unlock()
+	target := indexRoutes(routes)
 	a.logger.Debug("snapshot received", "routes", len(routes))
+	if err := a.reconcile(from, target, true); err != nil {
+		a.compensate(from)
+		return err
+	}
+	a.mu.Lock()
+	a.confirmed = target
+	a.mu.Unlock()
+	return nil
 }
 
-func (a *routeApplier) OnLocalDelta(d configclient.Delta) {
+// OnLocalDelta applies one locally-owned generation. The delta is
+// authoritative about its BEFORE image, so a delete for a route the
+// edge never cached (cold in-memory state after a restart) is seeded
+// into the baseline — otherwise its port would never be freed.
+func (a *routeApplier) OnLocalDelta(d configclient.Delta) error {
+	a.mu.Lock()
+	from := cloneRoutes(a.confirmed)
+	a.mu.Unlock()
+	target := cloneRoutes(from)
 	switch d.Kind {
 	case "delete":
-		// The row is gone, so the port it held is free again. This is the ONLY
-		// place allowed to say that: a proxy merely closing leaves the row live
-		// and still bound to its number — see session.PortAllocator.Reserve.
-		// configclient only calls OnLocalDelta when route.edge_node_id is this
-		// edge, so the number really is one of ours.
-		if a.ports != nil && d.Route.RemotePort > 0 {
-			a.ports.Unreserve(uint32(d.Route.RemotePort))
+		if _, known := target[int64(d.Route.ID)]; !known {
+			from[int64(d.Route.ID)] = d.Route
 		}
-		proxyID, ok := a.index.get(int64(d.Route.ID))
+		delete(target, int64(d.Route.ID))
+	case "upsert":
+		target[int64(d.Route.ID)] = d.Route
+	default:
+		// Unknown kind: do nothing rather than guessing; the generation
+		// still advances so the stream cannot wedge on a forward-compat tag.
+		a.logger.Warn("local delta with unknown kind; applying no local change",
+			"kind", d.Kind, "tunnel_id", d.Route.ID)
+	}
+	if err := a.reconcile(from, target, false); err != nil {
+		a.compensate(from)
+		return err
+	}
+	a.mu.Lock()
+	a.confirmed = target
+	a.mu.Unlock()
+	return nil
+}
+
+// OnRemoteDelta only NOTE a route owned elsewhere (visitor locating) and
+// best-effortly refreshes the owning client UI. It can never fail a
+// generation: remote routes touch no local router/port/policy state, and
+// a failed UI push behaves exactly as it did before generations existed.
+func (a *routeApplier) OnRemoteDelta(d configclient.Delta) {
+	a.mu.Lock()
+	if a.confirmed == nil {
+		a.confirmed = map[int64]configclient.Route{}
+	}
+	if d.Kind == "delete" {
+		delete(a.confirmed, int64(d.Route.ID))
+	} else {
+		a.confirmed[int64(d.Route.ID)] = d.Route
+	}
+	a.mu.Unlock()
+	a.logger.Debug("remote delta noted",
+		"kind", d.Kind, "edge", d.Route.EdgeNodeID,
+		"tunnel_id", d.Route.ID, "domain", d.Route.Domain)
+	// even a "remote" route may belong to a client currently
+	// connected to THIS edge (unassigned edge_node_id=0 routes land here).
+	a.forwardToClient(d)
+}
+
+// reconcile drives live state from the confirmed set `from` to `target`.
+// fullReplace=true sends per-client FullSync frames; false sends
+// per-route upsert/close delta frames. Client notification runs first so
+// its failure leaves all local state untouched.
+func (a *routeApplier) reconcile(from, target map[int64]configclient.Route, fullReplace bool) error {
+	if err := a.notifyClients(from, target, fullReplace); err != nil {
+		return err
+	}
+	a.applyPortsAndRoutes(from, target)
+	return nil
+}
+
+// compensate restores local effects after a failed reconcile. Client
+// frames already on the wire cannot be recalled; the resync the caller
+// triggers re-pushes the authoritative view, and a client reconnecting
+// gets the same from its post-handshake catch-up.
+func (a *routeApplier) compensate(confirmed map[int64]configclient.Route) {
+	a.mu.Lock()
+	from := cloneRoutes(a.confirmed)
+	a.mu.Unlock()
+	if len(from) == 0 && len(confirmed) == 0 {
+		return
+	}
+	// A best-effort restore of ports/routes/policy; never errors outward.
+	if err := a.reconcile(confirmed, from, false); err != nil {
+		a.logger.Warn("compensation push failed; resync will restore", "err", err)
+	}
+	a.mu.Lock()
+	a.confirmed = from
+	a.mu.Unlock()
+}
+
+// notifyClients performs the CONFIG_PUSH half of a generation.
+func (a *routeApplier) notifyClients(from, target map[int64]configclient.Route, fullReplace bool) error {
+	if a.manager == nil {
+		return nil
+	}
+	if fullReplace {
+		// Every client mentioned by either side needs the authoritative
+		// list (a client whose routes all vanished must get an empty
+		// FullSync so its UI prunes them).
+		cids := map[int64]struct{}{}
+		for _, r := range from {
+			if r.ClientID > 0 {
+				cids[r.ClientID] = struct{}{}
+			}
+		}
+		for _, r := range target {
+			if r.ClientID > 0 {
+				cids[r.ClientID] = struct{}{}
+			}
+		}
+		for cid := range cids {
+			sess := a.findClientSession(cid)
+			if sess == nil {
+				continue // offline: catch-up FullSync on next handshake
+			}
+			routes := make([]configclient.Route, 0)
+			for _, r := range target {
+				if r.ClientID == cid {
+					routes = append(routes, r)
+				}
+			}
+			if err := sess.SendControl(protocolFrameConfigPush,
+				buildFullConfigPush(routes, a.baseDomain)); err != nil {
+				return fmt.Errorf("full-sync CONFIG_PUSH to client %d: %w", cid, err)
+			}
+			a.logger.Info("snapshot full-sync pushed to client",
+				"client_id", cid, "session_id", sess.ID, "n", len(routes))
+		}
+		return nil
+	}
+
+	// Delta mode: close routes removed (or re-homed away), upsert routes
+	// added or materially changed.
+	for id, old := range from {
+		rnew, keep := target[id]
+		if keep && rnew.EdgeNodeID == old.EdgeNodeID {
+			continue
+		}
+		if old.ClientID <= 0 {
+			continue
+		}
+		if err := a.pushOne(configclient.Delta{Kind: "delete", Route: old}); err != nil {
+			return err
+		}
+	}
+	for id, r := range target {
+		old, existed := from[id]
+		if existed && !routePushChanged(old, r) {
+			continue
+		}
+		if r.ClientID <= 0 {
+			continue
+		}
+		if err := a.pushOne(configclient.Delta{Kind: "upsert", Route: r}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// routePushChanged reports whether the client-visible fields of a route
+// changed (config_json is server-enforced at the edge and not pushed).
+func routePushChanged(old, cur configclient.Route) bool {
+	return old.Name != cur.Name ||
+		old.Type != cur.Type ||
+		old.LocalAddr != cur.LocalAddr ||
+		old.Domain != cur.Domain ||
+		old.Subdomain != cur.Subdomain ||
+		old.RemotePort != cur.RemotePort ||
+		old.Status != cur.Status
+}
+
+// pushOne forwards a single upsert/delete to its owning ONLINE session.
+// No matching session (client offline) is success, not failure.
+func (a *routeApplier) pushOne(d configclient.Delta) error {
+	if a.manager == nil || d.Route.ClientID <= 0 {
+		return nil
+	}
+	sess := a.findClientSession(d.Route.ClientID)
+	if sess == nil {
+		return nil
+	}
+	push := buildConfigPushFromDelta(d, a.baseDomain)
+	if push == nil {
+		return nil
+	}
+	if err := sess.SendControl(protocolFrameConfigPush, push); err != nil {
+		return fmt.Errorf("CONFIG_PUSH %s tunnel %d to client %d: %w",
+			d.Kind, d.Route.ID, d.Route.ClientID, err)
+	}
+	a.logger.Info("delta forwarded to client",
+		"client_id", d.Route.ClientID,
+		"session_id", sess.ID,
+		"kind", d.Kind, "tunnel_id", d.Route.ID)
+	return nil
+}
+
+// applyPortsAndRoutes mutates the local, non-failing half of a
+// generation: the port pool tracks the local tcp/udp set, the router
+// drops deleted proxies, policies hot-swap on config_json edits.
+func (a *routeApplier) applyPortsAndRoutes(from, target map[int64]configclient.Route) {
+	a.applyPortSet(from, target)
+	a.applyRouteDeletes(from, target)
+	a.applyPolicyUpserts(from, target)
+}
+
+// localTCPPorts is the set of remote ports the route set says THIS edge
+// owns for tcp/udp rows.
+func localTCPPorts(rs map[int64]configclient.Route, self int64) map[uint32]struct{} {
+	out := map[uint32]struct{}{}
+	for _, r := range rs {
+		if r.EdgeNodeID != self || r.RemotePort <= 0 {
+			continue
+		}
+		if r.Type == "tcp" || r.Type == "udp" {
+			out[uint32(r.RemotePort)] = struct{}{}
+		}
+	}
+	return out
+}
+
+func (a *routeApplier) applyPortSet(from, target map[int64]configclient.Route) {
+	if a.ports == nil {
+		return
+	}
+	oldPorts := localTCPPorts(from, a.edgeNodeID)
+	newPorts := localTCPPorts(target, a.edgeNodeID)
+	a.mu.Lock()
+	tracked := make(map[uint32]struct{}, len(a.streamReserved))
+	for p := range a.streamReserved {
+		tracked[p] = struct{}{}
+	}
+	a.mu.Unlock()
+
+	// Gone from the target: free the number. The candidate set unions what
+	// this applier tracks with what the baseline names — a delete delta for
+	// a cold-cache row must still release the port its row held.
+	for p := range tracked {
+		if _, want := newPorts[p]; want {
+			continue
+		}
+		a.ports.Unreserve(p)
+		delete(tracked, p)
+	}
+	for p := range oldPorts {
+		if _, want := newPorts[p]; want {
+			continue
+		}
+		if _, had := tracked[p]; had {
+			continue
+		}
+		// The row is gone; this is the ONLY event allowed to free the
+		// number (a proxy merely closing leaves its row live).
+		a.ports.Unreserve(p)
+	}
+	// Newly owned: take the number out of circulation.
+	for p := range newPorts {
+		if _, have := tracked[p]; have {
+			continue
+		}
+		a.ports.Reserve(p)
+		tracked[p] = struct{}{}
+	}
+
+	a.mu.Lock()
+	a.streamReserved = tracked
+	a.mu.Unlock()
+}
+
+func (a *routeApplier) applyRouteDeletes(from, target map[int64]configclient.Route) {
+	if a.index == nil {
+		return
+	}
+	for id, old := range from {
+		if old.EdgeNodeID != a.edgeNodeID {
+			continue
+		}
+		if rnew, keep := target[id]; keep && rnew.EdgeNodeID == a.edgeNodeID {
+			continue
+		}
+		proxyID, ok := a.index.get(id)
 		if !ok {
 			// Either we never knew this tunnel (stale delta after restart)
 			// or it was already unregistered.
 			a.logger.Debug("local delete: proxy_id not found in index",
-				"tunnel_id", d.Route.ID)
-		} else {
-			a.registrar.UnregisterByProxyID(proxyID)
-			a.index.del(int64(d.Route.ID))
-			a.logger.Info("local delete applied",
-				"tunnel_id", d.Route.ID, "proxy_id", proxyID, "domain", d.Route.Domain)
+				"tunnel_id", id)
+			continue
 		}
-	case "upsert":
-		// Route already owned locally — nothing to do for the router itself,
-		// BUT hot-update the live proxy's security policy from the edited
-		// config_json so a console/SPA IP-allowlist change takes effect
-		// WITHOUT a reconnect. Server-authoritative: the blob comes from
-		// config-svc (tunnel-svc's row), not the daemon.
-		a.applyPolicyDelta(d)
+		a.registrar.UnregisterByProxyID(proxyID)
+		a.index.del(id)
+		a.logger.Info("local delete applied",
+			"tunnel_id", id, "proxy_id", proxyID, "domain", old.Domain)
 	}
-	a.forwardToClient(d)
 }
 
-// applyPolicyDelta hot-swaps a live proxy's security policy when its tunnel's
-// config_json changes. No-op (and safe) when the tunnel isn't currently served
-// by this edge — the proxy then picks up the policy at its next registration.
-// Best-effort + fail-open: a malformed blob keeps the current policy.
-func (a *routeApplier) applyPolicyDelta(d configclient.Delta) {
+func (a *routeApplier) applyPolicyUpserts(from, target map[int64]configclient.Route) {
+	for id, r := range target {
+		if r.EdgeNodeID != a.edgeNodeID {
+			continue
+		}
+		if old, existed := from[id]; existed && old.ConfigJSON == r.ConfigJSON && old.Status == r.Status {
+			continue
+		}
+		a.applyPolicyRoute(r)
+	}
+}
+
+// applyPolicyRoute hot-swaps a live proxy's security policy when its
+// tunnel's config_json changes. No-op (and safe) when the tunnel isn't
+// currently served by this edge — the proxy picks up the policy at its
+// next registration. Fail-open by design: a malformed blob keeps the
+// current policy (serving must never blackhole over a config glitch),
+// and a blob whose OAuth secret cannot be resolved keeps the live gate.
+func (a *routeApplier) applyPolicyRoute(r configclient.Route) {
 	if a.manager == nil || a.index == nil {
 		return
 	}
-	proxyID, ok := a.index.get(int64(d.Route.ID))
+	proxyID, ok := a.index.get(int64(r.ID))
 	if !ok {
 		return // not live here yet — registration will apply the policy
 	}
-	pol, err := policy.Parse(d.Route.ConfigJSON)
+	pol, err := policy.Parse(r.ConfigJSON)
 	if err != nil {
 		a.logger.Warn("hot policy update: parse config_json failed; keeping current",
-			"tunnel_id", d.Route.ID, "err", err)
+			"tunnel_id", r.ID, "err", err)
 		return
 	}
 	// Find the live session that owns this proxy (the tunnel's client), then
 	// swap the policy atomically — listeners reading it never see a torn value.
-	var target *session.Session
-	if d.Route.ClientID > 0 {
-		a.manager.All(func(s *session.Session) bool {
-			if s.DeviceID == d.Route.ClientID {
-				target = s
-				return false
-			}
-			return true
-		})
-	}
+	target := a.findClientSession(r.ClientID)
 	if target == nil {
 		return
 	}
@@ -498,7 +817,7 @@ func (a *routeApplier) applyPolicyDelta(d configclient.Delta) {
 	resolveOAuthSecret(context.Background(), a.logger, a.secrets, p, pol)
 	if pol.NeedsOAuthSecret() {
 		a.logger.Error("hot policy update would drop this tunnel's login; keeping the current policy",
-			"tunnel_id", d.Route.ID, "policy", pol.OAuthPolicyRef())
+			"tunnel_id", r.ID, "policy", pol.OAuthPolicyRef())
 		return
 	}
 	p.SetPolicy(pol)
@@ -507,51 +826,36 @@ func (a *routeApplier) applyPolicyDelta(d configclient.Delta) {
 	// new connection (a browser holds its connection open otherwise).
 	cut := target.CloseProxyConnsDenied(proxyID, pol)
 	a.logger.Info("hot policy update applied",
-		"tunnel_id", d.Route.ID, "proxy_id", proxyID,
+		"tunnel_id", r.ID, "proxy_id", proxyID,
 		"has_ip_rules", pol.HasIPRules(), "conns_cut", cut)
 }
 
-func (a *routeApplier) OnRemoteDelta(d configclient.Delta) {
-	a.logger.Debug("remote delta noted",
-		"kind", d.Kind, "edge", d.Route.EdgeNodeID,
-		"tunnel_id", d.Route.ID, "domain", d.Route.Domain)
-	// even a "remote" route may belong to a client currently
-	// connected to THIS edge (unassigned edge_node_id=0 routes land here).
-	a.forwardToClient(d)
-}
-
-// forwardToClient finds the live session whose DeviceID matches
-// d.Route.ClientID and sends a CONFIG_PUSH frame announcing the
-// upsert/delete. No-op when no matching session, when manager isn't
-// wired, or when the route carries no client_id.
-func (a *routeApplier) forwardToClient(d configclient.Delta) {
-	if a.manager == nil || d.Route.ClientID <= 0 {
-		return
+// findClientSession returns the live session for a device id, or nil
+// when the owning client is offline.
+func (a *routeApplier) findClientSession(clientID int64) *session.Session {
+	if a.manager == nil || clientID <= 0 {
+		return nil
 	}
 	var target *session.Session
 	a.manager.All(func(s *session.Session) bool {
-		if s.DeviceID == d.Route.ClientID {
+		if s.DeviceID == clientID {
 			target = s
 			return false // stop iteration
 		}
 		return true
 	})
-	if target == nil {
-		return
-	}
-	push := buildConfigPushFromDelta(d, a.baseDomain)
-	if push == nil {
-		return
-	}
-	if err := target.SendControl(protocolFrameConfigPush, push); err != nil {
+	return target
+}
+
+// forwardToClient finds the live session whose DeviceID matches
+// d.Route.ClientID and best-effortly sends a CONFIG_PUSH frame
+// announcing the upsert/delete. Failures are logged, not propagated:
+// this is the remote-route/UI path and must never fail a generation.
+func (a *routeApplier) forwardToClient(d configclient.Delta) {
+	if err := a.pushOne(d); err != nil {
 		a.logger.Debug("forward to client failed",
 			"client_id", d.Route.ClientID, "err", err)
-		return
 	}
-	a.logger.Info("delta forwarded to client",
-		"client_id", d.Route.ClientID,
-		"session_id", target.ID,
-		"kind", d.Kind, "tunnel_id", d.Route.ID)
 }
 
 // runDenySweeper pumps state from the usage deny hook into the live

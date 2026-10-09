@@ -15,6 +15,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"path/filepath"
 
 	"google.golang.org/grpc"
 
@@ -193,6 +194,14 @@ func wirePlatform(ctx context.Context, logger *slog.Logger, in platformInputs) (
 			baseDomain: cfg.Tunnel.BaseDomain,
 			ports:      in.ports,
 		}
+		// Persist the confirmed config generation under state.dir so the
+		// edge resumes the config stream after a restart instead of
+		// trusting a reconnect snapshot blindly. Empty state.dir degrades
+		// to an in-memory cursor (every cold boot re-baselines).
+		var cursorPath string
+		if cfg.State.Dir != "" {
+			cursorPath = filepath.Join(cfg.State.Dir, "config-cursor.json")
+		}
 		cc, err := configclient.StartWithClient(ctx, logger,
 			bffedgeclient.NewConfigAdapter(cpBFF.Client),
 			configclient.Options{
@@ -200,6 +209,7 @@ func wirePlatform(ctx context.Context, logger *slog.Logger, in platformInputs) (
 				Region:     cfg.Region,
 				Version:    version,
 				Applier:    applier,
+				CursorPath: cursorPath,
 			})
 		if err != nil {
 			return fail(fmt.Errorf("config-svc subscribe via bff-edge: %w", err))
