@@ -249,7 +249,7 @@ func wirePlatform(ctx context.Context, logger *slog.Logger, in platformInputs) (
 	case cfg.ServesMesh() && cfg.Mesh.Label != "":
 		if cfg.Mesh.IsPlatformKind() {
 			region := cfg.Mesh.Label
-			deps.relayReporter = newPlatformRelayUsageReporter(bus, region, logger)
+			deps.relayReporter = newPlatformRelayUsageReporter(bus, region, cfg.State.Dir, logger)
 			if !cfg.Mesh.RequireAuth {
 				logger.Warn("platform relay usage will NOT be attributed: relay.require_auth is off, so nodes present no grant and the relay cannot tell whose bytes it forwards",
 					"region", region)
@@ -257,7 +257,7 @@ func wirePlatform(ctx context.Context, logger *slog.Logger, in platformInputs) (
 			logger.Info("relay usage reporter wired (platform, per-org)", "region", region)
 		} else {
 			region := "self-" + cfg.Mesh.Label
-			deps.relayReporter = newRelayUsageReporter(bus, cfg.OrgID, region, logger)
+			deps.relayReporter = newRelayUsageReporter(bus, cfg.OrgID, region, cfg.State.Dir, logger)
 			logger.Info("relay usage reporter wired (self-hosted)", "region", region, "cluster_fallback_org", cfg.OrgID)
 		}
 	}
